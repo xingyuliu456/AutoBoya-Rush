@@ -9,7 +9,7 @@ import rush_logic as rush
 from autoboya import session
 from autoboya.auth import AuthSession, CaptchaChallenge
 from autoboya.cache import CourseCache
-from autoboya.exceptions import CaptchaRequired, CourseFull, CourseNotOpen, SessionExpired
+from autoboya.exceptions import BoyaApiError, CaptchaRequired, CourseFull, CourseNotOpen, SessionExpired
 from autoboya.models import BoyaCourse, UserRecord
 
 
@@ -48,8 +48,8 @@ def test_rush_logs_in_prompts_for_captcha_and_waits_for_numbered_course(monkeypa
     opened_images = []
     monkeypatch.setattr(cli.os, "startfile", opened_images.append, raising=False)
 
-    open_course = BoyaCourse(100, "现在可选", select_start="2026-11-18 09:00:00", select_end=str(end))
-    future_course = BoyaCourse(200, "稍后开放", select_start=str(start), select_end=str(end))
+    open_course = BoyaCourse(100, "现在可选", category="美育", select_start="2026-11-18 09:00:00", select_end=str(end))
+    future_course = BoyaCourse(200, "稍后开放", category="劳育", select_start=str(start), select_end=str(end))
     full_course = BoyaCourse(300, "人数已满", select_start=str(start), select_end=str(end), current_count=1, max_count=1)
     selected_course = BoyaCourse(400, "已经选择", select_start=str(start), select_end=str(end), selected=True)
     expired_course = BoyaCourse(500, "已经关闭", select_start="2026-11-18 09:00:00", select_end="2026-11-18 09:30:00")
@@ -90,7 +90,11 @@ def test_rush_logs_in_prompts_for_captcha_and_waits_for_numbered_course(monkeypa
             return [future_course]
 
         def query_statistics(self):
-            return {"validCount": 1}
+            events.append("statistics")
+            return {
+                "validCount": 1,
+                "statistical": {"60|博雅课程": {"55|德育": {"assessmentCount": 4, "selectAssessmentCount": 2}}},
+            }
 
     monkeypatch.setattr(session, "AuthClient", FakeAuthClient)
     monkeypatch.setattr(session, "BykcClient", FakeBykcClient)
@@ -106,12 +110,17 @@ def test_rush_logs_in_prompts_for_captcha_and_waits_for_numbered_course(monkeypa
     assert all(name in result.output for name in ("现在可选", "稍后开放", "未开抢", "选课成功"))
     assert all(name not in result.output for name in ("人数已满", "已经选择", "已经关闭"))
     assert "请输入 1 到 2" in result.output
-    assert events[:3] == ["login", "courses", ("config", start - timedelta(seconds=25))]
+    statistics_output, course_output = result.output.split("课程类型", 1)
+    assert "博雅要求与完成情况" in statistics_output
+    assert any("德育" in row and [cell.strip() for cell in row.split("│")[2:4]] == ["4", "2"] for row in statistics_output.splitlines())
+    assert "美育" in course_output
+    assert "劳育" in course_output
+    assert events[:4] == ["login", "courses", "statistics", ("config", start - timedelta(seconds=25))]
     attempts = [event[1] for event in events if isinstance(event, tuple) and event[0] == "select"]
     assert len(attempts) == 6
     assert attempts[0] == start - timedelta(seconds=2)
     assert attempts[1] - attempts[0] == timedelta(seconds=0.4)
-    assert events[-1] == "chosen"
+    assert events[-2:] == ["chosen", "statistics"]
     assert CourseCache(store).load_selected("student")[0]["id"] == 200
 
 
@@ -164,3 +173,30 @@ def test_rush_explains_how_to_configure_an_unregistered_student(monkeypatch, tmp
 
     assert result.exit_code == 2
     assert "python -m autoboya user add" in result.output
+
+
+def test_rush_shows_courses_when_statistics_are_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTOBOYA_HOME", str(tmp_path))
+    now = datetime(2026, 11, 18, 10)
+    freeze_rush_clock(monkeypatch, now)
+    store = cli.AutoBoyaStore()
+    store.init()
+    store.upsert_user(UserRecord("student"))
+
+    def query_statistics():
+        raise BoyaApiError("unavailable", "统计暂时不可用")
+
+    client = SimpleNamespace(
+        client=SimpleNamespace(close=lambda: None),
+        query_courses=lambda: [
+            BoyaCourse(100, "测试课程", select_start=str(now), select_end=str(now + timedelta(hours=1)))
+        ],
+        query_statistics=query_statistics,
+    )
+    monkeypatch.setattr(cli, "force_login_bykc_client", lambda *args, **kwargs: client)
+    result = CliRunner().invoke(cli.app, ["--user", "student"], input="0\n")
+
+    assert result.exit_code == 0, result.output
+    assert "暂时无法读取博雅统计" in result.output
+    assert "测试课程" in result.output
+    assert "课程序号" in result.output

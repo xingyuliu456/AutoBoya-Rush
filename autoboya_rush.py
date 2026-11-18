@@ -12,8 +12,8 @@ from rich.table import Table
 from autoboya.auth import CaptchaChallenge
 from autoboya.bykc import BykcClient
 from autoboya.cache import CourseCache
-from autoboya.cli import HELP_CONTEXT, current_semester_window, fail_command, mask
-from autoboya.exceptions import AutoBoyaError, SessionExpired
+from autoboya.cli import HELP_CONTEXT, current_semester_window, fail_command, mask, print_stats_table
+from autoboya.exceptions import AutoBoyaError, BoyaApiError, SessionExpired
 from autoboya.session import call_with_reauth, force_login_bykc_client
 from autoboya.storage import AutoBoyaStore
 
@@ -56,6 +56,17 @@ def rush(
             client = connect()
             courses = client.query_courses()
         CourseCache(store).save_courses(courses)
+        try:
+            try:
+                statistics = client.query_statistics()
+            except SessionExpired:
+                client = connect()
+                statistics = client.query_statistics()
+        except (BoyaApiError, SessionExpired, httpx.HTTPError) as exc:
+            typer.echo(f"暂时无法读取博雅统计，继续显示课程列表。{exc}", err=True)
+        else:
+            typer.echo("博雅要求与完成情况")
+            print_stats_table(statistics, username=user)
         candidate = choose_rush_candidate(rush_candidates(courses, datetime.now()))
         if candidate is None:
             return
@@ -91,14 +102,14 @@ def choose_rush_candidate(candidates: list[RushCandidate]) -> RushCandidate | No
     if not candidates:
         typer.echo("没有未开抢或正在开放的未选课程（满员课程已过滤）。")
         return None
-    table = Table("序号", "课程", "状态", "开放选课", "上课时间", "地点", "人数/容量")
+    table = Table("序号", "课程", "课程类型", "状态", "开放选课", "上课时间", "地点", "人数/容量")
     now = datetime.now()
     for index, candidate in enumerate(candidates, start=1):
         course = candidate.course
         current = "?" if course.current_count is None else str(course.current_count)
         capacity = "?" if course.max_count is None else str(course.max_count)
         table.add_row(
-            str(index), course.name, "未开抢" if now < candidate.start else "可选",
+            str(index), course.name, course.category or "-", "未开抢" if now < candidate.start else "可选",
             candidate.start.strftime("%m-%d %H:%M:%S"), course.course_start or "-",
             course.location or "-", f"{current}/{capacity}",
         )
